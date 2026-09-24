@@ -22,6 +22,16 @@ WS_URL      = "wss://ws.eodhistoricaldata.com/ws/us?api_token=" + EODHD_TOKEN
 # several times a second, so broadcasts are throttled to one per FX_MIN_INTERVAL.
 FX_WS_URL   = "wss://ws.eodhistoricaldata.com/ws/forex?api_token=" + EODHD_TOKEN
 FX_SYMBOLS  = [s.strip().upper() for s in os.environ.get("FX_SYMBOLS", "GBPUSD").split(",") if s.strip()]
+# VIX is an INDEX, so it is not on any EODHD websocket: subscribing to VIX / ^VIX / VIX.INDX
+# on /ws/us returns nothing and there is no /ws/index endpoint (verified 2026-09-24). The
+# REST real-time endpoint does serve it as VIX.INDX, so it is polled instead. Index data is
+# delayed - the quote carries its own timestamp and the page is told the age, so a stale
+# number can never be shown as live.
+VIX_URL      = "https://eodhd.com/api/real-time/{sym}?api_token=" + EODHD_TOKEN + "&fmt=json"
+VIX_SYMBOL   = os.environ.get("VIX_SYMBOL", "VIX.INDX")
+VIX_KEY      = os.environ.get("VIX_KEY", "VIX")          # what the page sees in PRICES
+VIX_INTERVAL = float(os.environ.get("VIX_INTERVAL", "60"))   # seconds between polls
+VIX_IDLE     = float(os.environ.get("VIX_IDLE", "600"))      # slower when the quote stops moving
 FX_MIN_INTERVAL = float(os.environ.get("FX_MIN_INTERVAL_SEC", "1.0"))
 PORT        = int(os.environ.get("STREAMER_PORT", "9100"))
 SYM_REFRESH = int(os.environ.get("SYM_REFRESH_SEC", "60"))
@@ -158,6 +168,48 @@ async def sym_loop():
             print("resubscribe failed:", repr(e)[:120], flush=True)
 
 
+async def vix_loop():
+    """Spot VIX, polled from the REST real-time endpoint and published like a ticker.
+
+    One call per poll, so it backs off to VIX_IDLE when the quote stops changing (overnight,
+    weekends) rather than burning the API allowance on a number that is not moving. Stored in
+    PRICES under VIX_KEY with src='rest' and the quote's own timestamp, so the page can show
+    how old it is - it is delayed data and must not be painted as a live tick.
+    """
+    import urllib.request
+    last_ts, interval = None, VIX_INTERVAL
+    while True:
+        try:
+            url = VIX_URL.format(sym=VIX_SYMBOL)
+            raw = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: urllib.request.urlopen(url, timeout=15).read())
+            m = json.loads(raw)
+            px, ts = m.get("close"), m.get("timestamp")
+            if px in (None, "NA") or ts in (None, "NA"):
+                interval = VIX_IDLE                      # market closed or symbol unavailable
+            else:
+                px = float(px); ts = int(ts) * 1000       # EODHD gives seconds; PRICES uses ms
+                prev = m.get("previousClose")
+                rec = {"p": round(px, 2), "t": ts, "src": "rest", "index": True}
+                try:
+                    if prev not in (None, "NA") and float(prev) > 0:
+                        rec["chg_pct"] = round(100 * (px / float(prev) - 1), 2)
+                except (TypeError, ValueError):
+                    pass
+                PRICES[VIX_KEY] = rec
+                if ts != last_ts:                        # only broadcast a genuinely new quote
+                    last_ts = ts
+                    interval = VIX_INTERVAL
+                    broadcast({"ticker": VIX_KEY, "price": rec["p"], "t": ts,
+                               "src": "rest", "index": True, "chg_pct": rec.get("chg_pct")})
+                else:
+                    interval = min(interval * 1.5, VIX_IDLE)
+        except Exception as e:
+            print("vix poll failed:", repr(e)[:140], flush=True)
+            interval = min(max(interval, VIX_INTERVAL) * 2, VIX_IDLE)
+        await asyncio.sleep(interval)
+
+
 async def handle_prices(request):
     return web.json_response({"prices": PRICES, "subscribed": sorted(SUBS),
                               "last_msg_age_s": round(time.time() - LAST_MSG["t"], 1) if LAST_MSG["t"] else None})
@@ -167,6 +219,9 @@ async def handle_health(request):
     return web.json_response({"ok": True, "subscribed": sorted(SUBS),
                               "have_prices": len(PRICES),
                               "fx": {s: PRICES.get(s) for s in FX_SYMBOLS},
+                              "vix": PRICES.get(VIX_KEY),
+                              "vix_age_s": (round(time.time() - PRICES[VIX_KEY]["t"] / 1000, 1)
+                                            if PRICES.get(VIX_KEY) else None),
                               "ws_up": _ws_send["fn"] is not None})
 
 
@@ -206,7 +261,7 @@ async def main():
     site = web.TCPSite(runner, "127.0.0.1", PORT)
     await site.start()
     print(f"price-streamer on 127.0.0.1:{PORT}", flush=True)
-    await asyncio.gather(ws_loop(), sym_loop(), fx_loop())
+    await asyncio.gather(ws_loop(), sym_loop(), fx_loop(), vix_loop())
 
 
 if __name__ == "__main__":
